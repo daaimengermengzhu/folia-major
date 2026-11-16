@@ -45,6 +45,7 @@ pub struct AppState {
 
 static APP_STATE: Mutex<Option<AppState>> = Mutex::new(None);
 static REATTACHING: AtomicBool = AtomicBool::new(false);
+static NATIVE_WRITES: crate::native_write::NativeWrites = crate::native_write::NativeWrites::new();
 
 fn with_state<T>(f: impl FnOnce(&mut AppState) -> T) -> Option<T> {
     APP_STATE.lock().ok().and_then(|mut guard| {
@@ -63,12 +64,14 @@ pub fn resident_worker_w() -> Option<isize> {
 }
 
 pub unsafe fn relocate(request: &crate::display_move::Request) -> Result<(), String> {
-    let hwnd = resident_folia_hwnd().ok_or("Wallpaper is not attached")?;
-    let (worker, mode) = crate::attach::move_to_display(HWND(hwnd as _), request)?;
-    with_state(|state| { state.worker_w = worker.0 as isize; state.last_zassert = Some(Instant::now()); });
-    crate::mouse_forward::update_worker(worker);
-    emit(&Event::Attached { hwnd, workerw: worker.0 as isize, mode: mode.as_str() });
-    Ok(())
+    NATIVE_WRITES.run(|| {
+        let hwnd = resident_folia_hwnd().ok_or("Wallpaper is not attached")?;
+        let (worker, mode) = crate::attach::move_to_display(HWND(hwnd as _), request)?;
+        with_state(|state| { state.worker_w = worker.0 as isize; state.last_zassert = Some(Instant::now()); });
+        crate::mouse_forward::update_worker(worker);
+        emit(&Event::Attached { hwnd, workerw: worker.0 as isize, mode: mode.as_str() });
+        Ok(())
+    })
 }
 
 pub fn emit(event: &Event) {
@@ -269,26 +272,28 @@ fn spawn_reattach() {
                 });
                 break;
             }
-            match crate::attach::attach_window(hwnd) {
-                Ok((worker_w, mode)) => {
-                    if crate::DETACH_REQUESTED.load(Ordering::SeqCst) {
-                        let _ = crate::attach::detach_window(hwnd);
-                        break;
-                    }
-                    with_state(|state| {
-                        state.worker_w = worker_w.0 as isize;
-                        state.last_zassert = None;
-                    });
-                    emit(&Event::Attached {
-                        hwnd: folia,
-                        workerw: worker_w.0 as isize,
-                        mode: mode.as_str(),
-                    });
-                    // Keep mouse reporting pointed at the (possibly new) WorkerW for the
-                    // foreground filter.
-                    let _ = crate::mouse_forward::register(worker_w);
-                    break;
+            let result = NATIVE_WRITES.run(|| {
+                let (worker_w, mode) = crate::attach::attach_window(hwnd)?;
+                if crate::DETACH_REQUESTED.load(Ordering::SeqCst) {
+                    let _ = crate::attach::detach_window(hwnd);
+                    return Ok(());
                 }
+                with_state(|state| {
+                    state.worker_w = worker_w.0 as isize;
+                    state.last_zassert = None;
+                });
+                emit(&Event::Attached {
+                    hwnd: folia,
+                    workerw: worker_w.0 as isize,
+                    mode: mode.as_str(),
+                });
+                // Keep mouse reporting pointed at the (possibly new) WorkerW for the
+                // foreground filter.
+                let _ = crate::mouse_forward::register(worker_w);
+                Ok(())
+            });
+            match result {
+                Ok(()) => break,
                 Err(err) => {
                     if attempt + 1 == REATTACH_MAX_ATTEMPTS {
                         emit(&Event::Error {

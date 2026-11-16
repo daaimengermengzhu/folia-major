@@ -32,7 +32,7 @@ concurrency:
 jobs:
   triage:
     name: Triage pull request
-    if: github.event_name == 'workflow_dispatch' || github.event.sender.type != 'Bot'
+    if: github.repository == 'chthollyphile/folia-major' && (github.event_name == 'workflow_dispatch' || github.event.sender.type != 'Bot')
     runs-on: ubuntu-latest
     timeout-minutes: 5
 

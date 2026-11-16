@@ -20,6 +20,7 @@ mod mouse_forward;
 
 use cli::Command;
 mod display_move;
+mod native_write;
 use events::Event;
 
 fn main() {

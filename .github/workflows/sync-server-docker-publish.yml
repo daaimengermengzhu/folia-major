@@ -26,6 +26,7 @@ env:
 
 jobs:
   prepare:
+    if: github.repository == 'chthollyphile/folia-major'
     name: Validate sync-server release
     runs-on: ubuntu-latest
     outputs:

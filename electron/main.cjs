@@ -51,6 +51,7 @@ const wallpaperWatchdogModule = require('./wallpaper/wallpaperWatchdog.cjs');
 const { requestWallpaperEntryConfirmation } = require('./wallpaper/wallpaperEntryRequest.cjs');
 const windowsWallpaperModule = require('./wallpaper/windowsWallpaperController.cjs');
 const { createWindowsWallpaperTargetResolver } = require('./wallpaper/windowsWallpaperTarget.cjs');
+const { createDisplayCoordinator } = require('./wallpaper/displayCoordinator.cjs');
 const { createWindowsWallpaperMouseInjector } = require('./wallpaper/windowsWallpaperMouse.cjs');
 const macWallpaperModule = require('./wallpaper/macWallpaperController.cjs');
 const {
@@ -65,8 +66,6 @@ const {
   WALLPAPER_DISPLAY_SETTING_KEY,
   normalizeWallpaperDisplayChoice,
   resolveWallpaperDisplay,
-  isSameDisplay,
-  shouldMoveWallpaper,
   describeWallpaperDisplays,
 } = require('./wallpaper/wallpaperDisplay.cjs');
 const { createKugouApiBridge } = require('./kugou/kugouApiBridge.cjs');
@@ -738,6 +737,11 @@ const windowsWallpaper = windowsWallpaperModule.createWindowsWallpaperController
     }
     reconcileWindowsWallpaperWindowTransparency();
   },
+  onAttached: () => {
+    void wallpaperDisplayCoordinator.onAttached().catch(error => {
+      console.warn('[WallpaperWin] applying deferred display choice failed', error);
+    });
+  },
   onMouseInput: forwardWallpaperMouseInput,
 });
 
@@ -1049,77 +1053,30 @@ function buildWallpaperDisplayTrayItem(locale) {
 // "automatic" follows the app window, so a wallpaper that is up stays where it is. A display change moves the
 // wallpaper only for a chosen display that was unplugged or came back (shouldMoveWallpaper);
 // without a choice it leaves the wallpaper where it is, as before.
-let wallpaperDisplayApplyGeneration = 0;
-let wallpaperDisplayPending = Promise.resolve();
-let wallpaperExportPreparing = false;
-async function applyWallpaperDisplayChoice({ choiceChanged = false, forceGeometry = false, canApply = () => true } = {}) {
-  if (!canApply()) return false;
-  if (process.platform === 'darwin') {
-    // A deferred entry owns the frame until the full-screen exit lands, and reads the choice then.
-    if (!isMacWallpaperActive || macWallpaperPendingEnter || !mainWindow || mainWindow.isDestroyed()) {
-      return false;
-    }
-    applyMacWallpaperFrame(); // no-op when the window already fills the display it belongs on
+const wallpaperDisplayCoordinator = createDisplayCoordinator({
+  platform: process.platform,
+  screen,
+  getWindow: () => mainWindow,
+  getChoice: getWallpaperDisplayChoice,
+  getCurrentDisplay: () => isWindowsWallpaperMode() ? windowsWallpaperTarget.current() : x11WallpaperDisplay,
+  getTargetDisplay: () => isWindowsWallpaperMode() ? windowsWallpaperTarget.peek() : getChosenOrPrimaryWallpaperDisplay(),
+  rememberDisplay: display => windowsWallpaperTarget.rememberDisplay(display),
+  isWindowsActive: isWindowsWallpaperMode,
+  isX11Active: isX11WallpaperMode,
+  isExporting: () => Boolean(videoExportWindowRestoreState),
+  windowsWallpaper,
+  applyMac: () => {
+    if (!isMacWallpaperActive || macWallpaperPendingEnter || !mainWindow || mainWindow.isDestroyed()) return false;
+    applyMacWallpaperFrame();
     applyMacAmbientLevel();
     return true;
-  }
-  const onWindows = isWindowsWallpaperMode();
-  if (!onWindows && !isX11WallpaperMode()) {
-    return false;
-  }
-  const hasToMove = () => {
-    try {
-      const current = onWindows ? windowsWallpaperTarget.current() : x11WallpaperDisplay;
-      // Topology and DPI changes can resize the same display. They use the resident movement
-      // queue too, so no one-shot helper can post geometry after this queue's completion ACK.
-      if (onWindows && forceGeometry) return Boolean(current && windowsWallpaperTarget.peek());
-      if (choiceChanged) {
-        // Windows, back to automatic: that rule follows the app window, and with the wallpaper up
-        // there is no app window to follow. The wallpaper stays where it is; the next entry
-        // follows the window again.
-        if (onWindows && !getWallpaperDisplayChoice()) {
-          return false;
-        }
-        const target = onWindows ? windowsWallpaperTarget.peek() : getChosenOrPrimaryWallpaperDisplay();
-        return Boolean(current && target) && !isSameDisplay(target, current);
-      }
-      return shouldMoveWallpaper(screen.getAllDisplays(), getWallpaperDisplayChoice(), current);
-    } catch (error) {
-      return false;
-    }
-  };
-  if (!onWindows && !hasToMove()) {
-    return false;
-  }
-  wallpaperDisplayApplyGeneration += 1;
-  const generation = wallpaperDisplayApplyGeneration;
-  if (onWindows) {
-    const moving = wallpaperDisplayPending.then(async () => {
-      if (generation !== wallpaperDisplayApplyGeneration || !canApply() || wallpaperExportPreparing
-          || videoExportWindowRestoreState || !isWindowsWallpaperMode() || !hasToMove()) return false;
-      const target = windowsWallpaperTarget.peek();
-      if (!target || !mainWindow || mainWindow.isDestroyed()) return false;
-      const movingWindow = mainWindow;
-      await windowsWallpaper.moveToRect(screen.dipToScreenRect(null, target.bounds));
-      if (!isWindowsWallpaperMode() || movingWindow !== mainWindow || movingWindow.isDestroyed()) return false;
-      windowsWallpaperTarget.rememberDisplay(target);
-      return generation === wallpaperDisplayApplyGeneration;
-    });
-    wallpaperDisplayPending = moving.catch(() => {});
-    return moving;
-  }
-  await requestWindowPlaybackHandoff();
-  // The page took a moment to answer: a newer change, a mode toggle or another rebuild may have
-  // settled this one meanwhile.
-  if (generation !== wallpaperDisplayApplyGeneration || !canApply() || !hasToMove()) {
-    return false;
-  }
-  if (!isX11WallpaperMode()) {
-    return false;
-  }
-  console.log('[Wallpaper] the wallpaper belongs on another display now, relaunching');
-  wallpaperWatchdog.relaunchSelfNormal();
-  return true;
+  },
+  requestPlaybackHandoff: requestWindowPlaybackHandoff,
+  relaunchX11: () => wallpaperWatchdog.relaunchSelfNormal(),
+});
+
+function applyWallpaperDisplayChoice(options) {
+  return wallpaperDisplayCoordinator.apply(options);
 }
 
 // Stores the display the settings page picked (null: automatic) and applies it to a running
@@ -2775,12 +2732,12 @@ const MOD_SYSTEM_ENABLED_SETTING_KEY = 'MOD_SYSTEM_ENABLED';
 const DEFAULT_STAGE_API_PORT = 32107;
 const DEFAULT_OBS_BROWSER_SOURCE_PORT = 32108;
 const DEFAULT_LYRIC_API_PORT = 32109;
-const FOLIA_RELEASES_URL = 'https://github.com/chthollyphile/folia-major/releases';
+const FOLIA_RELEASES_URL = 'https://github.com/daaimengermengzhu/folia-major/releases';
 const FOLIA_GITHUB_REPOSITORY = {
-  owner: 'chthollyphile',
+  owner: 'daaimengermengzhu',
   repo: 'folia-major',
 };
-const WINDOWS_APP_USER_MODEL_ID = 'top.izuna.foliamajor';
+const WINDOWS_APP_USER_MODEL_ID = 'io.github.daaimengermengzhu.folia.dualscreen';
 const REMOTE_CONTROL_WINDOW_TITLE = 'Folia Remote';
 const WINDOW_PLAYBACK_HANDOFF_REQUEST_TIMEOUT_MS = 800;
 const bundledAppIconPath = path.join(__dirname, '../build/icon.png');
@@ -4131,10 +4088,9 @@ function getPackagedReleaseChannel() {
 }
 
 function getCurrentReleaseChannel() {
-  return resolveReleaseChannel(
-    app.getVersion(),
-    store.get(UPDATE_CHANNEL_SETTING_KEY) || getPackagedReleaseChannel(),
-  );
+  // Source preview: upstream releases must never overwrite the community edition.
+  // Enable our own updater only after a reviewed community installer is published.
+  return resolveReleaseChannel(app.getVersion(), 'internal');
 }
 
 function normalizeUpdateChannelSelection(value) {
@@ -8191,46 +8147,46 @@ ipcMain.handle('video-export-prepare-window', async (event, size) => {
     return false;
   }
 
-  wallpaperExportPreparing = true;
-  try { await wallpaperDisplayPending; } finally { wallpaperExportPreparing = false; }
-  if (!isTrustedMainWindowContents(event.sender) || !mainWindow || mainWindow.isDestroyed()) return false;
+  return wallpaperDisplayCoordinator.prepareExport(() => {
+    if (!isTrustedMainWindowContents(event.sender) || !mainWindow || mainWindow.isDestroyed()) return false;
 
-  // The renderer sends its DPR at the moment of export; the mount-time report can be missing
-  // or stale, and sizing with the wrong DPR renders the content at the wrong physical size.
-  const reportedDpr = Number(size?.dpr);
-  if (Number.isFinite(reportedDpr) && reportedDpr > 0) {
-    mainWindow.__dpr = reportedDpr;
-  }
+    // The renderer sends its DPR at the moment of export; the mount-time report can be missing
+    // or stale, and sizing with the wrong DPR renders the content at the wrong physical size.
+    const reportedDpr = Number(size?.dpr);
+    if (Number.isFinite(reportedDpr) && reportedDpr > 0) {
+      mainWindow.__dpr = reportedDpr;
+    }
 
-  if (!videoExportWindowRestoreState) {
-    videoExportWindowRestoreState = {
-      bounds: mainWindow.__transparentFullscreen === true
-        ? (mainWindow.__transparentFullscreenRestoreBounds || mainWindow.getBounds())
-        : mainWindow.getBounds(),
-      isMaximized: mainWindow.isMaximized(),
-      isFullScreen: isMainWindowFullscreen(mainWindow),
+    if (!videoExportWindowRestoreState) {
+      videoExportWindowRestoreState = {
+        bounds: mainWindow.__transparentFullscreen === true
+          ? (mainWindow.__transparentFullscreenRestoreBounds || mainWindow.getBounds())
+          : mainWindow.getBounds(),
+        isMaximized: mainWindow.isMaximized(),
+        isFullScreen: isMainWindowFullscreen(mainWindow),
+      };
+      backgroundThrottling.refresh();
+    }
+
+    if (isMainWindowFullscreen(mainWindow)) {
+      setMainWindowFullscreen(mainWindow, false);
+    }
+
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize();
+    }
+
+    const fit = fitMainWindowBoundsToExportSize(exportSize);
+    if (!fit) {
+      return false;
+    }
+    const { exportDpr } = fit;
+    mainWindow.focus();
+    return {
+      success: true,
+      dpr: exportDpr,
     };
-    backgroundThrottling.refresh();
-  }
-
-  if (isMainWindowFullscreen(mainWindow)) {
-    setMainWindowFullscreen(mainWindow, false);
-  }
-
-  if (mainWindow.isMaximized()) {
-    mainWindow.unmaximize();
-  }
-
-  const fit = fitMainWindowBoundsToExportSize(exportSize);
-  if (!fit) {
-    return false;
-  }
-  const { exportDpr } = fit;
-  mainWindow.focus();
-  return {
-    success: true,
-    dpr: exportDpr,
-  };
+  });
 });
 
 ipcMain.handle('video-export-restore-window', (event) => {

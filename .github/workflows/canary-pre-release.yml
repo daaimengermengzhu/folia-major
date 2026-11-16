@@ -27,7 +27,7 @@ jobs:
   prepare:
     name: Prepare Cielo build
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[canary]')
+    if: github.repository == 'chthollyphile/folia-major' && (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[canary]'))
     outputs:
       version: ${{ steps.meta.outputs.version }}
       branch_name: ${{ steps.meta.outputs.branch_name }}

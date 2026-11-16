@@ -60,6 +60,7 @@ function createWindowsWallpaperController(options = {}) {
     // (mode) => void for the desktop architecture reported by `attached` events
     // ('classic' = Win10/early Win11 WorkerW sibling, 'raised' = Win11 24H2+ Progman child).
     onAttachMode,
+    onAttached, // () => void, replay the latest display request after startup or recovery
     // (event) => void for helper mouse events (mousemove/mousedown/mouseup in *physical* screen
     // pixels — the helper is per-monitor DPI aware; the consumer converts them with
     // screen.screenToDipPoint, see windowsWallpaperMouse.cjs). The main process injects these into
@@ -71,6 +72,7 @@ function createWindowsWallpaperController(options = {}) {
 
   let helperProcess = null;
   let attached = false;
+  let recovering = false;
   let attaching = false;
   let degraded = false;
   let lastEventAt = 0;
@@ -99,7 +101,7 @@ function createWindowsWallpaperController(options = {}) {
         || !int32(rect.x + rect.width) || !int32(rect.y + rect.height)) {
       return Promise.reject(new Error('Invalid wallpaper display rectangle'));
     }
-    if (!attached || !helperProcess?.stdin?.writable) return Promise.reject(new Error('Wallpaper helper is not attached'));
+    if (!attached || recovering || !helperProcess?.stdin?.writable) return Promise.reject(new Error('Wallpaper helper is not attached'));
     const id = ++moveSequence;
     return new Promise((resolve, reject) => {
       // Keep the completion barrier until the native thread acknowledges or the existing
@@ -169,6 +171,7 @@ function createWindowsWallpaperController(options = {}) {
     const child = helperProcess;
     helperProcess = null;
     attached = false;
+    recovering = false;
     attaching = false;
     stopHeartbeatMonitor();
     stopHealthyReset();
@@ -243,6 +246,7 @@ function createWindowsWallpaperController(options = {}) {
     lastEventAt = Date.now();
     switch (event.event) {
       case 'attached': {
+        recovering = false;
         const firstAttachment = !attached;
         attached = true;
         attaching = false;
@@ -256,6 +260,7 @@ function createWindowsWallpaperController(options = {}) {
         if (typeof event.mode === 'string') {
           onAttachMode?.(event.mode);
         }
+        onAttached?.();
         break;
       }
       case 'heartbeat':
@@ -274,6 +279,8 @@ function createWindowsWallpaperController(options = {}) {
       // The helper re-attaches on its own; these are informational unless it reports an error.
       case 'workerw-destroyed':
       case 'explorer-restarted':
+        recovering = true;
+        break;
       case 'reasserted':
       case 'moved':
       case 'detached':
@@ -285,6 +292,7 @@ function createWindowsWallpaperController(options = {}) {
           // it — a plain re-attach of the same hwnd would be pointless. Either way the helper
           // has nothing useful left to do.
           attached = false;
+    recovering = false;
           if (event.kind === 'window-destroyed') {
             killHelper();
             onReattachNeeded?.();
@@ -378,6 +386,7 @@ function createWindowsWallpaperController(options = {}) {
       const wasAttached = attached;
       helperProcess = null;
       attached = false;
+    recovering = false;
       attaching = false;
       stopHeartbeatMonitor();
       stopHealthyReset();
@@ -457,6 +466,7 @@ function createWindowsWallpaperController(options = {}) {
     // would otherwise leave `attaching` stuck true and every future attach() a silent 'already'.
     helperProcess = null;
     attached = false;
+    recovering = false;
     attaching = false;
     if (!child) {
       return false;
@@ -497,7 +507,7 @@ function createWindowsWallpaperController(options = {}) {
     killHelper,
     handleHelperEvent,
     parseHelperEventLine,
-    isAttached: () => attached,
+    isAttached: () => attached && !recovering,
     isDegraded: () => degraded,
     getFailureCount,
   };

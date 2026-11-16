@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   sync:
+    if: github.repository == 'chthollyphile/folia-major'
     name: Regenerate code map
     runs-on: ubuntu-latest
     timeout-minutes: 40

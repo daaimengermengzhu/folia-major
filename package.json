@@ -1,14 +1,14 @@
 {
-  "name": "folia-major",
-  "productName": "Folia",
-  "desktopName": "folia-major.desktop",
-  "description": "Lyrics Reimagine",
+  "name": "folia-dualscreen",
+  "productName": "Folia DualScreen",
+  "desktopName": "folia-dualscreen.desktop",
+  "description": "Folia 双屏社区衍生版 / unofficial Windows dual-screen edition",
   "author": {
     "name": "chthollyphile",
     "email": "chthollyphile@users.noreply.github.com"
   },
   "private": true,
-  "version": "0.7.28",
+  "version": "0.7.28-dualscreen.1",
   "license": "AGPL-3.0",
   "type": "module",
   "main": "electron/main.cjs",
@@ -79,8 +79,8 @@
     "manual:ai-probe": "node test/manual/ai_probe.mjs"
   },
   "build": {
-    "appId": "top.izuna.foliamajor",
-    "productName": "Folia",
+    "appId": "io.github.daaimengermengzhu.folia.dualscreen",
+    "productName": "Folia DualScreen",
     "beforePack": "build/beforePack.cjs",
     "afterPack": "build/afterPack.cjs",
     "electronLanguages": [
@@ -97,7 +97,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "chthollyphile",
+        "owner": "daaimengermengzhu",
         "repo": "folia-major"
       }
     ],
@@ -280,6 +280,9 @@
           "StartupWMClass": "folia-major"
         }
       }
+    },
+    "extraMetadata": {
+      "releaseChannel": "internal"
     }
   },
   "dependencies": {

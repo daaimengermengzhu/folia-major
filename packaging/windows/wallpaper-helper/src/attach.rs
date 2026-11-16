@@ -300,7 +300,7 @@ pub unsafe fn attach_window(hwnd: HWND) -> Result<(HWND, AttachMode), String> {
 
     normalize_styles(hwnd);
     SetParent(hwnd, Some(worker_w)).map_err(|err| format!("SetParent failed: {err}"))?;
-    reassert_geometry_on_monitor(hwnd, target_monitor);
+    reassert_geometry_on_monitor(hwnd, target_monitor)?;
     reassert_z_order_top(hwnd);
     Ok((worker_w, mode))
 }
@@ -334,7 +334,9 @@ pub unsafe fn move_to_display(hwnd: HWND, request: &crate::display_move::Request
 
 unsafe fn place_in_parent(hwnd: HWND, parent: HWND, rect: RECT) -> Result<(), String> {
     let mut origin = POINT { x: rect.left, y: rect.top };
-    ScreenToClient(parent, &mut origin).ok().map_err(|err| err.to_string())?;
+    if !parent.0.is_null() {
+        ScreenToClient(parent, &mut origin).ok().map_err(|err| err.to_string())?;
+    }
     // The helper owns wallpaper geometry. Do not let WM_WINDOWPOSCHANGING clamp this fixed-size
     // Chromium window back to its previous monitor's dimensions; WM_WINDOWPOSCHANGED still runs.
     SetWindowPos(hwnd, None, origin.x, origin.y, rect.right - rect.left, rect.bottom - rect.top,
@@ -445,21 +447,21 @@ pub(crate) fn ensure_thread_dpi_awareness() {
 /// say in it (multi-display targeting lives in electron/wallpaper/windowsWallpaperTarget.cjs).
 pub unsafe fn reassert_geometry(hwnd: HWND) {
     let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    reassert_geometry_on_monitor(hwnd, monitor);
+    let _ = reassert_geometry_on_monitor(hwnd, monitor);
 }
 
 /// Fills `monitor` with the window, converting the monitor rect into the parent's client space.
 /// Callers that have just re-parented the window must pass the monitor the window was on *before*
 /// the re-parent (see attach_window): the window's own position is already that of its host.
-unsafe fn reassert_geometry_on_monitor(hwnd: HWND, monitor: HMONITOR) {
+unsafe fn reassert_geometry_on_monitor(hwnd: HWND, monitor: HMONITOR) -> Result<(), String> {
     if monitor.is_invalid() {
-        return;
+        return Err("Wallpaper monitor is unavailable".into());
     }
     with_physical_dpi(|| {
         let mut info = MONITORINFO::default();
         info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-            return;
+            return Err("Cannot read wallpaper monitor geometry".into());
         }
         let rect: RECT = info.rcMonitor;
         // SetWindowPos positions a child window relative to its PARENT's client area, so the
@@ -467,22 +469,10 @@ unsafe fn reassert_geometry_on_monitor(hwnd: HWND, monitor: HMONITOR) {
         // agrees while the window sits at the parent's (0,0). A not-yet-attached top-level window
         // has no parent and already takes screen coordinates.
         let parent = GetAncestor(hwnd, GA_PARENT);
-        let mut origin = POINT { x: rect.left, y: rect.top };
-        if !parent.0.is_null() {
-            let _ = ScreenToClient(parent, &mut origin);
-        }
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            origin.x,
-            origin.y,
-            width,
-            height,
-            SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
-        );
-    });
+        // Recovery must finish Chromium's geometry before releasing the shared native-write
+        // gate. An asynchronous SetWindowPos could otherwise overwrite a later acknowledged move.
+        place_in_parent(hwnd, parent, rect)
+    })
 }
 
 /// Re-inserts the window at the top of the WorkerW child stack (co-existence with other

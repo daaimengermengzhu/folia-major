@@ -41,6 +41,7 @@ interface ControllerOptions {
   getHwnd?: () => number | null;
   onDegrade?: () => void;
   onReattachNeeded?: () => void;
+  onAttached?: () => void;
   onMouseInput?: (event: HelperEvent) => void;
 }
 
@@ -575,5 +576,39 @@ describe('error classification', () => {
     );
     expect(onReattachNeeded).not.toHaveBeenCalled();
     expect(controller.isDegraded()).toBe(false);
+  });
+});
+
+
+describe('display request replay notification', () => {
+  it('notifies after both startup and same-mode recovery attachment', () => {
+    const onAttached = vi.fn();
+    const f = createHarness({ onAttached });
+    f.controller.attach();
+    f.children[0].writeStdout('{"event":"attached","mode":"raised"}\n');
+    f.children[0].writeStdout('{"event":"attached","mode":"raised"}\n');
+    expect(onAttached).toHaveBeenCalledTimes(2);
+    f.controller.killHelper();
+  });
+});
+
+
+describe('same-helper desktop recovery readiness', () => {
+  it.each(['explorer-restarted', 'workerw-destroyed'])('defers moves during %s until attachment completes', async event => {
+    const onAttached = vi.fn();
+    const f = createHarness({ onAttached });
+    f.controller.attach();
+    const child = f.children[0];
+    child.writeStdout('{"event":"attached","mode":"raised"}\n');
+    expect(f.controller.isAttached()).toBe(true);
+    child.writeStdout(JSON.stringify({ event }) + '\n');
+    expect(f.controller.isAttached()).toBe(false);
+    await expect(f.controller.moveToRect({ x: -1600, y: 0, width: 1600, height: 2560 })).rejects.toThrow('not attached');
+    expect(child.stdinWrites).toEqual([]);
+    child.writeStdout('{"event":"attached","mode":"raised"}\n');
+    expect(f.controller.isAttached()).toBe(true);
+    expect(onAttached).toHaveBeenCalledTimes(2);
+    expect(f.children).toHaveLength(1);
+    f.controller.killHelper();
   });
 });

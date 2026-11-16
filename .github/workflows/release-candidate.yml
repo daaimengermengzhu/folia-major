@@ -30,6 +30,7 @@ concurrency:
 
 jobs:
   prepare-release:
+    if: github.repository == 'chthollyphile/folia-major'
     name: Prepare pre-release metadata
     runs-on: ubuntu-latest
     outputs:

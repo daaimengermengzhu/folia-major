@@ -1,166 +1,164 @@
-import fs from 'node:fs';
 import { createRequire } from 'node:module';
-import vm from 'node:vm';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-// Exercise Folia's actual asynchronous display mover against an export starting during handoff.
 const require = createRequire(import.meta.url);
-const source = fs.readFileSync(new URL('../../../electron/main.cjs', import.meta.url), 'utf8');
-const start = source.indexOf('async function applyWallpaperDisplayChoice(');
-const end = source.indexOf('\n// Stores the display', start);
-const { isSameDisplay, shouldMoveWallpaper } = require('../../../electron/wallpaper/wallpaperDisplay.cjs');
-const { createAutoDisplaySession } = require('../../../electron/wallpaper/autoDisplaySession.cjs');
+const { createDisplayCoordinator } = require('../../../electron/wallpaper/displayCoordinator.cjs');
 
-afterEach(() => vi.useRealTimers());
+type Display = { id: number; bounds: { x: number; y: number; width: number; height: number } };
+const primary: Display = { id: 1, bounds: { x: 0, y: 0, width: 1920, height: 1080 } };
+const secondary: Display = { id: 2, bounds: { x: -1600, y: -648, width: 1600, height: 2560 } };
+const third: Display = { id: 3, bounds: { x: 1920, y: 0, width: 1920, height: 1080 } };
 
 function fixture() {
-    const current = { id: 1, bounds: { x: 0, y: 0, width: 1920, height: 1080 } };
-    const target = { id: 2, bounds: { x: -1920, y: 0, width: 1920, height: 1080 } };
-    let finish!: (value: unknown) => void;
-    const rebuild = vi.fn();
-    const context = {
-        process: { platform: 'win32' },
-        isWindowsWallpaperMode: () => true,
-        isX11WallpaperMode: () => false,
-        windowsWallpaperTarget: { current: () => current, peek: () => target, rememberDisplay: vi.fn() },
-        windowsWallpaper: { moveToRect: vi.fn(() => new Promise(resolve => { finish = resolve; })) },
-        mainWindow: { isDestroyed: () => false },
-        wallpaperDisplayPending: Promise.resolve(), wallpaperExportPreparing: false, videoExportWindowRestoreState: null,
-        getWallpaperDisplayChoice: () => target,
-        screen: { getAllDisplays: () => [current, target], dipToScreenRect: (_win: unknown, bounds: unknown) => bounds },
-        isSameDisplay, shouldMoveWallpaper,
-        wallpaperDisplayApplyGeneration: 0,
-        requestWindowPlaybackHandoff: vi.fn(() => new Promise(resolve => { finish = resolve; })),
-        recreateMainWindowWithTransparencyMode: rebuild,
-        isTransparentPlayerBackgroundEnabled: () => true,
-        console: { log: vi.fn() },
+    const window = { isDestroyed: () => false };
+    const state = { attached: true, active: true, exporting: false, current: primary,
+        target: secondary, choice: secondary as Display | null, window, displays: [primary, secondary, third] };
+    const completions: (() => void)[] = [];
+    const moveToRect = vi.fn(() => new Promise<void>(resolve => completions.push(resolve)));
+    const rememberDisplay = vi.fn((display: Display) => { state.current = display; });
+    const options = {
+        platform: 'win32',
+        screen: { getAllDisplays: () => state.displays, dipToScreenRect: (_window: unknown, bounds: unknown) => bounds },
+        getWindow: () => state.window,
+        getChoice: () => state.choice,
+        getCurrentDisplay: () => state.current,
+        getTargetDisplay: () => state.target,
+        rememberDisplay,
+        isWindowsActive: () => state.active,
+        isX11Active: () => false,
+        isExporting: () => state.exporting,
+        windowsWallpaper: { isAttached: () => state.attached, moveToRect },
+        applyMac: vi.fn(() => true), requestPlaybackHandoff: vi.fn(async () => {}), relaunchX11: vi.fn(),
     };
-    const apply = vm.runInNewContext(`${source.slice(start, end)}; applyWallpaperDisplayChoice`, context);
-    return { apply, rebuild, finish: () => finish({}), context };
+    const coordinator = createDisplayCoordinator(options);
+    return { state, options, coordinator, moveToRect, rememberDisplay,
+        finish: () => { const finish = completions.shift(); if (!finish) throw new Error('No pending move'); finish(); } };
 }
 
-describe('automatic display in-place movement', () => {
-    it('reapplies geometry on the same display through the resident queue', async () => {
+const flush = async () => { for (let i = 0; i < 8; i += 1) await Promise.resolve(); };
+
+describe('display coordinator', () => {
+    it('moves the same window without requesting an audio handoff', async () => {
         const f = fixture();
-        const resized = { id: 1, bounds: { x: 0, y: 0, width: 1080, height: 1920 } };
-        f.context.windowsWallpaperTarget.peek = () => resized;
-        f.context.getWallpaperDisplayChoice = () => resized;
-        expect(await f.apply({ choiceChanged: true })).toBe(false);
-        const metrics = f.apply({ forceGeometry: true }); await Promise.resolve();
-        f.finish(); expect(await metrics).toBe(true);
-        expect(f.context.windowsWallpaper.moveToRect).toHaveBeenCalledWith(resized.bounds);
+        const moving = f.coordinator.apply({ choiceChanged: true }); await flush();
+        expect(f.moveToRect).toHaveBeenCalledWith(secondary.bounds);
+        f.finish(); expect(await moving).toBe(true);
+        expect(f.state.current).toEqual(secondary);
+        expect(f.options.requestPlaybackHandoff).not.toHaveBeenCalled();
     });
 
-    it('keeps topology reassertion behind an in-flight relocation', async () => {
-        const f = fixture();
-        const first = f.apply({ choiceChanged: true }); await Promise.resolve();
-        const metrics = f.apply({ forceGeometry: true });
-        expect(f.context.windowsWallpaper.moveToRect).toHaveBeenCalledTimes(1);
-        f.finish(); await first; await Promise.resolve();
-        expect(f.context.windowsWallpaper.moveToRect).toHaveBeenCalledTimes(2);
-        f.finish(); expect(await metrics).toBe(true);
+    it('reapplies same-monitor geometry only when explicitly requested', async () => {
+        const f = fixture(); f.state.current = secondary;
+        expect(await f.coordinator.apply({ choiceChanged: true })).toBe(false);
+        const moving = f.coordinator.apply({ forceGeometry: true }); await flush();
+        f.finish(); expect(await moving).toBe(true);
     });
 
-    it('does not launch a one-shot helper for topology events, even when movement is skipped', async () => {
-        const start = source.indexOf('const reassertWallpaperGeometry = async () => {');
-        const end = source.indexOf('\n    const scheduleWallpaperGeometryReassert', start);
-        const context = { isWindowsWallpaperMode: () => true, windowsWallpaper: { isAttached: () => true },
-            applyWallpaperDisplayChoice: vi.fn(async () => false), spawn: vi.fn(),
-            resolveWallpaperHelperPath: () => 'helper.exe', getMainWindowNativeHwnd: () => 1 };
-        const reassert = vm.runInNewContext(`${source.slice(start, end)}; reassertWallpaperGeometry`, context);
-        await reassert();
-        expect(context.applyWallpaperDisplayChoice).toHaveBeenCalledWith({ forceGeometry: true });
-        expect(context.spawn).not.toHaveBeenCalled();
+    it('serializes a return request behind the native move already in progress', async () => {
+        const f = fixture(); const first = f.coordinator.apply({ choiceChanged: true }); await flush();
+        f.state.target = primary; f.state.choice = primary;
+        const back = f.coordinator.apply({ choiceChanged: true });
+        expect(f.moveToRect).toHaveBeenCalledTimes(1);
+        f.finish(); await first; await flush();
+        expect(f.moveToRect).toHaveBeenLastCalledWith(primary.bounds);
+        f.finish(); expect(await back).toBe(true); expect(f.state.current).toEqual(primary);
     });
 
-    it('skips topology geometry writes during export preparation', async () => {
-        const f = fixture(); f.context.wallpaperExportPreparing = true;
-        expect(await f.apply({ forceGeometry: true })).toBe(false);
-        expect(f.context.windowsWallpaper.moveToRect).not.toHaveBeenCalled();
+    it('uses the latest target when several requests are queued', async () => {
+        const f = fixture(); const first = f.coordinator.apply({ choiceChanged: true }); await flush();
+        const skipped = f.coordinator.apply({ forceGeometry: true });
+        f.state.target = third; f.state.choice = third;
+        const latest = f.coordinator.apply({ choiceChanged: true });
+        f.finish(); await first; expect(await skipped).toBe(false); await flush();
+        expect(f.moveToRect).toHaveBeenCalledTimes(2);
+        expect(f.moveToRect).toHaveBeenLastCalledWith(third.bounds);
+        f.finish(); expect(await latest).toBe(true);
     });
 
-    it('reasserts current wallpaper topology and manual choice after export restores the window', () => {
-        const start = source.indexOf("ipcMain.handle('video-export-restore-window', (event) => {");
-        const end = source.indexOf('\n\n// The export file', start);
-        let restore!: (event: unknown) => boolean;
-        const context = {
-            ipcMain: { handle: (_name: string, callback: typeof restore) => { restore = callback; } },
-            isTrustedMainWindowContents: () => true, isWindowsWallpaperMode: () => true,
-            mainWindow: { isDestroyed: () => false, setBounds: vi.fn(), maximize: vi.fn() },
-            videoExportWindowRestoreState: { bounds: { x: 0, y: 0, width: 1920, height: 1080 }, isFullScreen: false, isMaximized: false },
-            backgroundThrottling: { refresh: vi.fn() },
-            applyWallpaperDisplayChoice: vi.fn(async () => true),
-        };
-        vm.runInNewContext(source.slice(start, end), context);
-        expect(restore({})).toBe(true);
-        expect(context.videoExportWindowRestoreState).toBeNull();
-        expect(context.applyWallpaperDisplayChoice).toHaveBeenCalledWith({ forceGeometry: true });
+    it('retains a manual choice made before the helper is attached', async () => {
+        const f = fixture(); f.state.attached = false;
+        expect(await f.coordinator.apply({ choiceChanged: true })).toBe(false);
+        expect(f.moveToRect).not.toHaveBeenCalled();
+        f.state.attached = true;
+        const replay = f.coordinator.onAttached(); await flush();
+        f.finish(); expect(await replay).toBe(true);
+        expect(f.state.current).toEqual(secondary);
+        expect(await f.coordinator.onAttached()).toBe(false);
     });
-    it('retains a completed automatic move when a metrics request supersedes its generation', async () => {
-        vi.useFakeTimers();
+
+    it('replays only the newest manual selection after recovery', async () => {
+        const f = fixture(); f.state.attached = false;
+        await f.coordinator.apply({ choiceChanged: true });
+        f.state.target = third; f.state.choice = third;
+        await f.coordinator.apply({ choiceChanged: true });
+        f.state.attached = true;
+        const replay = f.coordinator.onAttached(); await flush();
+        expect(f.moveToRect).toHaveBeenCalledOnce();
+        expect(f.moveToRect).toHaveBeenCalledWith(third.bounds);
+        f.finish(); await replay;
+    });
+
+    it('drops a stale deferred automatic action when automatic mode is disabled', async () => {
+        const f = fixture(); f.state.attached = false; let enabled = true;
+        await f.coordinator.apply({ choiceChanged: true, canApply: () => enabled });
+        enabled = false; f.state.attached = true;
+        expect(await f.coordinator.onAttached()).toBe(false);
+        expect(f.moveToRect).not.toHaveBeenCalled();
+    });
+
+    it('retains the requested target when the helper dies during dispatch', async () => {
         const f = fixture();
-        const primary = { ...f.context.windowsWallpaperTarget.current(), workArea: { x: 0, y: 0, width: 1920, height: 1080 } };
-        const secondary = f.context.windowsWallpaperTarget.peek();
-        let actual = primary;
-        const session = createAutoDisplaySession({
-            platform: 'win32', store: { get: () => true },
-            screen: { ...f.context.screen, getPrimaryDisplay: () => primary },
-            canMove: () => true, getCurrentDisplay: () => actual, applyChoice: f.apply,
-            readWindows: () => [{ ...primary.bounds, maximized: true }], onChange: vi.fn(),
-        });
-        f.context.windowsWallpaperTarget.current = () => actual;
-        f.context.windowsWallpaperTarget.peek = () => session.getChoice();
-        f.context.windowsWallpaperTarget.rememberDisplay = vi.fn(display => { actual = display; });
-        f.context.getWallpaperDisplayChoice = () => session.getChoice();
-        await session.tick(); vi.advanceTimersByTime(2000);
-        const moving = session.tick(); await Promise.resolve();
-        const metrics = f.apply(); f.finish(); await moving; await metrics;
-        expect(actual.id).toBe(secondary.id);
-        expect(session.getChoice().id).toBe(secondary.id);
-        expect(await f.apply()).toBe(false);
-        expect(f.context.windowsWallpaper.moveToRect).toHaveBeenCalledTimes(1);
+        f.moveToRect.mockImplementationOnce(async () => { f.state.attached = false; throw new Error('session ended'); });
+        await expect(f.coordinator.apply({ choiceChanged: true })).rejects.toThrow('session ended');
+        expect(f.rememberDisplay).not.toHaveBeenCalled();
+        f.state.attached = true;
+        const replay = f.coordinator.onAttached(); await flush();
+        f.finish(); expect(await replay).toBe(true);
     });
-    it('honors a request to return while an earlier move is still in flight', async () => {
-        const f=fixture(); const a={id:1,bounds:{x:0,y:0,width:1920,height:1080}};
-        const b={id:2,bounds:{x:-1920,y:0,width:1920,height:1080}};
-        let actual=a,choice=b;
-        f.context.windowsWallpaperTarget.current=()=>actual;
-        f.context.windowsWallpaperTarget.peek=()=>choice;
-        f.context.windowsWallpaperTarget.rememberDisplay=vi.fn(display=>{actual=display});
-        f.context.getWallpaperDisplayChoice=()=>choice;
-        const first=f.apply({choiceChanged:true}); await Promise.resolve();
-        choice=a; const back=f.apply({choiceChanged:true});
-        f.finish(); await first; await Promise.resolve(); f.finish();
-        expect(await back).toBe(true); expect(actual.id).toBe(1);
-        expect(f.context.windowsWallpaper.moveToRect).toHaveBeenCalledTimes(2);
+
+    it('does not commit or retry a failed native move while the helper remains attached', async () => {
+        const f = fixture(); f.moveToRect.mockRejectedValueOnce(new Error('host unavailable'));
+        await expect(f.coordinator.apply({ choiceChanged: true })).rejects.toThrow('host unavailable');
+        expect(f.rememberDisplay).not.toHaveBeenCalled();
+        expect(await f.coordinator.onAttached()).toBe(false);
     });
-    it('cancels queued moves if export preparation starts before native dispatch', async () => {
-        const f=fixture();let unblock!:()=>void;
-        f.context.wallpaperDisplayPending=new Promise<void>(resolve=>{unblock=resolve});
-        const move=f.apply({choiceChanged:true});f.context.wallpaperExportPreparing=true;unblock();
-        expect(await move).toBe(false);expect(f.context.windowsWallpaper.moveToRect).not.toHaveBeenCalled();
+
+    it('does not commit a move after its window was replaced', async () => {
+        const f = fixture(); const moving = f.coordinator.apply({ choiceChanged: true }); await flush();
+        f.state.window = { isDestroyed: () => false }; f.finish();
+        expect(await moving).toBe(false); expect(f.rememberDisplay).not.toHaveBeenCalled();
     });
-    it('moves the existing window without a playback handoff or renderer rebuild', async () => {
-        const f = fixture(); const switching = f.apply({ choiceChanged: true, canApply: () => true });
-        await Promise.resolve();
-        f.finish(); expect(await switching).toBe(true);
-        expect(f.rebuild).not.toHaveBeenCalled();
-        expect(f.context.requestWindowPlaybackHandoff).not.toHaveBeenCalled();
-        expect(f.context.windowsWallpaper.moveToRect).toHaveBeenCalledWith({x:-1920,y:0,width:1920,height:1080});
+
+    it('waits for in-flight native completion before export and suppresses queued moves', async () => {
+        const f = fixture(); const moving = f.coordinator.apply({ choiceChanged: true }); await flush();
+        const queued = f.coordinator.apply({ forceGeometry: true });
+        const prepare = vi.fn(() => { f.state.exporting = true; return 'ready'; });
+        const exporting = f.coordinator.prepareExport(prepare);
+        await flush(); expect(prepare).not.toHaveBeenCalled();
+        f.finish(); await moving; expect(await queued).toBe(false);
+        expect(await exporting).toBe('ready');
+        expect(await f.coordinator.apply({ forceGeometry: true })).toBe(false);
+        f.state.exporting = false;
+        const restored = f.coordinator.apply({ forceGeometry: true }); await flush();
+        f.finish(); expect(await restored).toBe(true);
     });
-    it('does not move while an export is being prepared', async () => {
-        const f = fixture(); f.context.wallpaperExportPreparing = true;
-        expect(await f.apply({choiceChanged:true})).toBe(false);
-        expect(f.context.windowsWallpaper.moveToRect).not.toHaveBeenCalled();
-    });
-    it('does not commit the target when the native move fails', async () => {
-        const f = fixture(); f.context.windowsWallpaper.moveToRect.mockRejectedValueOnce(new Error('failed'));
-        await expect(f.apply({choiceChanged:true})).rejects.toThrow('failed');
-        expect(f.context.windowsWallpaperTarget.rememberDisplay).not.toHaveBeenCalled();
-    });
-    it('does not request a handoff after the automatic action is disabled', async () => {
+
+    it('releases the export barrier after failed preparation', async () => {
         const f = fixture();
-        expect(await f.apply({ choiceChanged: true, canApply: () => false })).toBe(false);
-        expect(f.context.requestWindowPlaybackHandoff).not.toHaveBeenCalled();
+        await expect(f.coordinator.prepareExport(() => { throw new Error('export failed'); })).rejects.toThrow('export failed');
+        const moving = f.coordinator.apply({ choiceChanged: true }); await flush();
+        f.finish(); expect(await moving).toBe(true);
+    });
+
+    it('preserves the existing macOS and X11 paths', async () => {
+        const f = fixture();
+        expect(await createDisplayCoordinator({ ...f.options, platform: 'darwin' }).apply()).toBe(true);
+        expect(f.options.applyMac).toHaveBeenCalledOnce();
+        const x11 = createDisplayCoordinator({ ...f.options, platform: 'linux',
+            isWindowsActive: () => false, isX11Active: () => true });
+        expect(await x11.apply({ choiceChanged: true })).toBe(true);
+        expect(f.options.requestPlaybackHandoff).toHaveBeenCalledOnce();
+        expect(f.options.relaunchX11).toHaveBeenCalledOnce();
+        expect(f.moveToRect).not.toHaveBeenCalled();
     });
 });

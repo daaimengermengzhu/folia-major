@@ -39,6 +39,7 @@ jobs:
     # 先在表达式层挡掉明显无关的事件，省一个 runner。脚本里会再完整判断一次。
     # GITHUB_TOKEN 触发的事件本来就不会启动 workflow；排除 Bot 是换成 PAT / App token 时的兜底。
     if: >-
+      github.repository == 'chthollyphile/folia-major' && (
       github.event_name == 'workflow_dispatch' || (
         github.event.sender.type != 'Bot' && (
           github.event_name == 'issues' ||
@@ -47,6 +48,7 @@ jobs:
           contains(github.event.issue.labels.*.name, 'needs-info') ||
           contains(github.event.issue.labels.*.name, 'bot: auto-closed')
         )
+      )
       )
     runs-on: ubuntu-latest
     timeout-minutes: 10
