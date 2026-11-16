@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: dualscreen-checks-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -22,10 +26,8 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run lint:install
-      - run: npm run lint:install
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run dedicatus
-      - run: npm run lint
       - run: npm run test:unit -- test/unit/electron/autoDisplay test/unit/electron/windowsWallpaper test/unit/electron/wallpaperDisplay.test.ts test/unit/electron/updateChannels.test.ts
       - run: cargo test --manifest-path packaging/windows/wallpaper-helper/Cargo.toml
